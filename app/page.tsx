@@ -20,7 +20,6 @@ import {
 } from "@heroui/react";
 import { motion } from "framer-motion";
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import { isSupabaseConfigured, supabase } from "../lib/supabaseClient";
 
 type ReadBook = {
   id: string;
@@ -64,8 +63,6 @@ type BookDetail = {
 };
 
 const STORAGE_KEY = "neels-library-v2";
-const SUPABASE_TABLE = "library_state";
-const SUPABASE_ROW_ID = "main";
 const BULK_IMPORT_KEY = "neels-library-bulk-import-v1";
 const BULK_READ_IMPORT_KEY = "neels-library-bulk-read-import-v1";
 const COVER_CACHE_KEY = "neels-library-cover-cache-v1";
@@ -235,6 +232,12 @@ export default function Home() {
   const [isDbSyncing, setIsDbSyncing] = useState(false);
   const [hasDbHydrated, setHasDbHydrated] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isOwner, setIsOwner] = useState(false);
+  const [isOwnerChecking, setIsOwnerChecking] = useState(true);
+  const [isOwnerModalOpen, setIsOwnerModalOpen] = useState(false);
+  const [ownerPasscode, setOwnerPasscode] = useState("");
+  const [ownerError, setOwnerError] = useState("");
+  const [isOwnerSubmitting, setIsOwnerSubmitting] = useState(false);
   const autoFetchInFlight = useRef(false);
   const attemptedCoverKeys = useRef<Set<string>>(new Set());
   const dbWriteTimeoutRef = useRef<number | null>(null);
@@ -251,6 +254,11 @@ export default function Home() {
   const [detailBook, setDetailBook] = useState<BookDetail | null>(null);
 
   const query = searchQuery.trim().toLowerCase();
+  const isDbConfigured = Boolean(
+    process.env.NEXT_PUBLIC_SUPABASE_URL &&
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY &&
+      process.env.NEXT_PUBLIC_SUPABASE_URL !== "undefined",
+  );
   const filteredReadBooks = query
     ? readBooks.filter((book) =>
         [
@@ -285,6 +293,53 @@ export default function Home() {
       JSON.stringify(Object.fromEntries(coverCacheRef.current.entries())),
     );
   };
+
+  const unlockOwnerMode = async () => {
+    setIsOwnerSubmitting(true);
+    setOwnerError("");
+    const res = await fetch("/api/owner/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ passcode: ownerPasscode }),
+    });
+    if (!res.ok) {
+      setOwnerError("wrong passcode");
+      setIsOwnerSubmitting(false);
+      return;
+    }
+    setIsOwner(true);
+    setOwnerPasscode("");
+    setIsOwnerModalOpen(false);
+    setIsOwnerSubmitting(false);
+  };
+
+  const logoutOwnerMode = async () => {
+    await fetch("/api/owner/logout", { method: "POST" });
+    setIsOwner(false);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const checkOwner = async () => {
+      try {
+        const res = await fetch("/api/owner/status", { cache: "no-store" });
+        const data = (await res.json().catch(() => ({ owner: false }))) as { owner?: boolean };
+        if (!cancelled) {
+          setIsOwner(Boolean(data.owner));
+          setIsOwnerChecking(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setIsOwner(false);
+          setIsOwnerChecking(false);
+        }
+      }
+    };
+    checkOwner();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -392,8 +447,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!isLoaded) return;
-    const db = supabase;
-    if (!isSupabaseConfigured || !db) {
+    if (!isDbConfigured) {
       setHasDbHydrated(true);
       return;
     }
@@ -401,74 +455,62 @@ export default function Home() {
     let cancelled = false;
 
     const hydrateFromDb = async () => {
-      setIsDbSyncing(true);
-      const { data } = await db
-        .from(SUPABASE_TABLE)
-        .select("payload")
-        .eq("id", SUPABASE_ROW_ID)
-        .maybeSingle();
-
-      if (cancelled) return;
-
-      if (data?.payload && typeof data.payload === "object") {
-        const payload = data.payload as {
-          readBooks?: Array<Partial<ReadBook>>;
-          toReadBooks?: Array<Partial<ToReadBook>>;
+      try {
+        setIsDbSyncing(true);
+        const res = await fetch("/api/library/load", { cache: "no-store" });
+        const data = (await res.json().catch(() => ({ payload: null }))) as {
+          payload?: unknown;
         };
-        const remoteRead = (payload.readBooks ?? []).map((book) => ({
-          id: book.id ?? crypto.randomUUID(),
-          title: (book.title ?? "untitled").trim(),
-          author: (book.author ?? "").trim(),
-          genre: (book.genre ?? "").trim(),
-          recommendedBy: (book.recommendedBy ?? "").trim(),
-          rating: safeRating(book.rating),
-          liked: (book.liked ?? "").trim(),
-          notes: (book.notes ?? "").trim(),
-          year: safeYear(book.year),
-          coverUrl:
-            book.coverUrl ??
-            coverCacheRef.current.get(coverCacheKey(book.title ?? "untitled", book.author ?? "")) ??
-            null,
-          createdAt: book.createdAt ?? new Date().toISOString(),
-        }));
-        const remoteToRead = (payload.toReadBooks ?? []).map((book) => ({
-          id: book.id ?? crypto.randomUUID(),
-          title: (book.title ?? "untitled").trim(),
-          author: (book.author ?? "").trim(),
-          genre: (book.genre ?? "").trim(),
-          recommendedBy: (book.recommendedBy ?? "").trim(),
-          reason: (book.reason ?? "").trim(),
-          coverUrl:
-            book.coverUrl ??
-            coverCacheRef.current.get(coverCacheKey(book.title ?? "untitled", book.author ?? "")) ??
-            null,
-          createdAt: book.createdAt ?? new Date().toISOString(),
-        }));
 
-        setReadBooks(remoteRead);
-        setToReadBooks(remoteToRead);
-        localStorage.setItem(
-          STORAGE_KEY,
-          JSON.stringify({ readBooks: remoteRead, toReadBooks: remoteToRead }),
-        );
-      } else {
-        const fallbackRaw = localStorage.getItem(STORAGE_KEY);
-        const fallbackParsed = fallbackRaw
-          ? (JSON.parse(fallbackRaw) as LibraryData)
-          : { readBooks: [], toReadBooks: [] };
-        await db.from(SUPABASE_TABLE).upsert({
-          id: SUPABASE_ROW_ID,
-          payload: {
-            readBooks: fallbackParsed.readBooks ?? [],
-            toReadBooks: fallbackParsed.toReadBooks ?? [],
-          },
-          updated_at: new Date().toISOString(),
-        });
-      }
+        if (cancelled) return;
 
-      if (!cancelled) {
-        setHasDbHydrated(true);
-        setIsDbSyncing(false);
+        if (data?.payload && typeof data.payload === "object") {
+          const payload = data.payload as {
+            readBooks?: Array<Partial<ReadBook>>;
+            toReadBooks?: Array<Partial<ToReadBook>>;
+          };
+          const remoteRead = (payload.readBooks ?? []).map((book) => ({
+            id: book.id ?? crypto.randomUUID(),
+            title: (book.title ?? "untitled").trim(),
+            author: (book.author ?? "").trim(),
+            genre: (book.genre ?? "").trim(),
+            recommendedBy: (book.recommendedBy ?? "").trim(),
+            rating: safeRating(book.rating),
+            liked: (book.liked ?? "").trim(),
+            notes: (book.notes ?? "").trim(),
+            year: safeYear(book.year),
+            coverUrl:
+              book.coverUrl ??
+              coverCacheRef.current.get(coverCacheKey(book.title ?? "untitled", book.author ?? "")) ??
+              null,
+            createdAt: book.createdAt ?? new Date().toISOString(),
+          }));
+          const remoteToRead = (payload.toReadBooks ?? []).map((book) => ({
+            id: book.id ?? crypto.randomUUID(),
+            title: (book.title ?? "untitled").trim(),
+            author: (book.author ?? "").trim(),
+            genre: (book.genre ?? "").trim(),
+            recommendedBy: (book.recommendedBy ?? "").trim(),
+            reason: (book.reason ?? "").trim(),
+            coverUrl:
+              book.coverUrl ??
+              coverCacheRef.current.get(coverCacheKey(book.title ?? "untitled", book.author ?? "")) ??
+              null,
+            createdAt: book.createdAt ?? new Date().toISOString(),
+          }));
+
+          setReadBooks(remoteRead);
+          setToReadBooks(remoteToRead);
+          localStorage.setItem(
+            STORAGE_KEY,
+            JSON.stringify({ readBooks: remoteRead, toReadBooks: remoteToRead }),
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setHasDbHydrated(true);
+          setIsDbSyncing(false);
+        }
       }
     };
 
@@ -477,20 +519,22 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [isLoaded]);
+  }, [isLoaded, isDbConfigured]);
 
   useEffect(() => {
-    const db = supabase;
-    if (!isLoaded || !hasDbHydrated || !isSupabaseConfigured || !db) return;
+    if (!isLoaded || !hasDbHydrated || !isDbConfigured || !isOwner) return;
     if (dbWriteTimeoutRef.current !== null) {
       window.clearTimeout(dbWriteTimeoutRef.current);
     }
     dbWriteTimeoutRef.current = window.setTimeout(async () => {
-      await db.from(SUPABASE_TABLE).upsert({
-        id: SUPABASE_ROW_ID,
-        payload: { readBooks, toReadBooks },
-        updated_at: new Date().toISOString(),
+      const res = await fetch("/api/library/save", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ payload: { readBooks, toReadBooks } }),
       });
+      if (res.status === 403) {
+        setIsOwner(false);
+      }
     }, 500);
 
     return () => {
@@ -498,7 +542,7 @@ export default function Home() {
         window.clearTimeout(dbWriteTimeoutRef.current);
       }
     };
-  }, [isLoaded, hasDbHydrated, readBooks, toReadBooks]);
+  }, [isLoaded, hasDbHydrated, isDbConfigured, isOwner, readBooks, toReadBooks]);
 
   useEffect(() => {
     if (!isLoaded || autoFetchInFlight.current) return;
@@ -578,6 +622,7 @@ export default function Home() {
   }, [isLoaded, readBooks, toReadBooks]);
 
   const addReadBook = async () => {
+    if (!isOwner) return;
     if (!readTitle.trim()) return;
     setIsSavingRead(true);
     const coverUrl = await fetchCoverUrl(readTitle, readAuthor);
@@ -609,6 +654,7 @@ export default function Home() {
   };
 
   const addToReadBook = async () => {
+    if (!isOwner) return;
     if (!toReadTitle.trim()) return;
     setIsSavingToRead(true);
     const coverUrl = await fetchCoverUrl(toReadTitle, toReadAuthor);
@@ -634,15 +680,18 @@ export default function Home() {
   };
 
   const removeReadBook = (id: string) => {
+    if (!isOwner) return;
     setReadBooks((prev) => prev.filter((book) => book.id !== id));
     if (editingId === id) setEditingId(null);
   };
 
   const removeToReadBook = (id: string) => {
+    if (!isOwner) return;
     setToReadBooks((prev) => prev.filter((book) => book.id !== id));
   };
 
   const startEdit = (book: ReadBook) => {
+    if (!isOwner) return;
     setEditingId(book.id);
     setEditAuthor(book.author);
     setEditGenre(book.genre);
@@ -654,6 +703,7 @@ export default function Home() {
   };
 
   const saveEdit = (id: string) => {
+    if (!isOwner) return;
     setReadBooks((prev) =>
       prev.map((book) =>
         book.id === id
@@ -674,6 +724,7 @@ export default function Home() {
   };
 
   const moveToRead = async (book: ToReadBook) => {
+    if (!isOwner) return;
     const currentYear = new Date().getFullYear();
     setReadBooks((prev) => [
       {
@@ -695,6 +746,7 @@ export default function Home() {
   };
 
   const refreshCoverForRead = async (id: string, title: string) => {
+    if (!isOwner) return;
     setBusyCoverId(id);
     const target = readBooks.find((book) => book.id === id);
     const cover = await fetchCoverUrl(title, target?.author);
@@ -707,6 +759,7 @@ export default function Home() {
   };
 
   const refreshCoverForToRead = async (id: string, title: string) => {
+    if (!isOwner) return;
     setBusyCoverId(id);
     const target = toReadBooks.find((book) => book.id === id);
     const cover = await fetchCoverUrl(title, target?.author);
@@ -784,6 +837,23 @@ export default function Home() {
             <Button as="a" href="/stats" size="sm" variant="flat" className="text-zinc-600 bg-zinc-100">
               stats
             </Button>
+          </NavbarItem>
+          <NavbarItem>
+            {isOwner ? (
+              <Button size="sm" variant="flat" className="text-zinc-700 bg-zinc-100" onPress={logoutOwnerMode}>
+                owner mode
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="flat"
+                className="text-zinc-600 bg-zinc-100"
+                onPress={() => setIsOwnerModalOpen(true)}
+                isDisabled={isOwnerChecking}
+              >
+                unlock edits
+              </Button>
+            )}
           </NavbarItem>
         </NavbarContent>
       </Navbar>
@@ -906,7 +976,7 @@ export default function Home() {
                               </div>
                             </div>
 
-                            {isEditing ? (
+                            {isOwner && isEditing ? (
                               <div className="max-h-[420px] space-y-2 overflow-y-auto pr-1" onClick={(e) => e.stopPropagation()}>
                                 <Input label="author" value={editAuthor} onValueChange={setEditAuthor} />
                                 <Input label="genre" value={editGenre} onValueChange={setEditGenre} />
@@ -945,7 +1015,7 @@ export default function Home() {
                                   </Button>
                                 </div>
                               </div>
-                            ) : (
+                            ) : isOwner ? (
                               <div className="mt-auto flex flex-wrap gap-2 pt-1" onClick={(e) => e.stopPropagation()}>
                                 <Button size="sm" variant="flat" onPress={() => startEdit(book)}>
                                   edit notes
@@ -962,7 +1032,7 @@ export default function Home() {
                                   remove
                                 </Button>
                               </div>
-                            )}
+                            ) : null}
                           </CardBody>
                           <div className="pointer-events-none absolute inset-x-0 bottom-0 h-3 bg-gradient-to-b from-zinc-100 to-transparent" />
                         </Card>
@@ -1041,22 +1111,24 @@ export default function Home() {
                             </div>
                           </div>
 
-                          <div className="mt-auto flex flex-wrap gap-2 pt-1" onClick={(e) => e.stopPropagation()}>
-                            <Button size="sm" variant="flat" onPress={() => moveToRead(book)}>
-                              move to read
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="flat"
-                              onPress={() => refreshCoverForToRead(book.id, book.title)}
-                              isLoading={busyCoverId === book.id}
-                            >
-                              refresh cover
-                            </Button>
-                            <Button size="sm" variant="flat" onPress={() => removeToReadBook(book.id)}>
-                              remove
-                            </Button>
-                          </div>
+                          {isOwner ? (
+                            <div className="mt-auto flex flex-wrap gap-2 pt-1" onClick={(e) => e.stopPropagation()}>
+                              <Button size="sm" variant="flat" onPress={() => moveToRead(book)}>
+                                move to read
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="flat"
+                                onPress={() => refreshCoverForToRead(book.id, book.title)}
+                                isLoading={busyCoverId === book.id}
+                              >
+                                refresh cover
+                              </Button>
+                              <Button size="sm" variant="flat" onPress={() => removeToReadBook(book.id)}>
+                                remove
+                              </Button>
+                            </div>
+                          ) : null}
                         </CardBody>
                         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-3 bg-gradient-to-b from-zinc-100 to-transparent" />
                       </Card>
@@ -1069,27 +1141,29 @@ export default function Home() {
         </motion.section>
       </main>
 
-      <Button
-        color="default"
-        radius="full"
-        className="fixed bottom-8 right-6 z-40 h-14 w-14 min-w-0 text-3xl shadow-[0_12px_24px_rgba(0,0,0,0.18)] bg-zinc-900 text-white"
-        onPress={() => setIsAddModalOpen(true)}
-      >
-        +
-      </Button>
+      {isOwner ? (
+        <>
+          <Button
+            color="default"
+            radius="full"
+            className="fixed bottom-8 right-6 z-40 h-14 w-14 min-w-0 text-3xl shadow-[0_12px_24px_rgba(0,0,0,0.18)] bg-zinc-900 text-white"
+            onPress={() => setIsAddModalOpen(true)}
+          >
+            +
+          </Button>
 
-      <Modal
-        isOpen={isAddModalOpen}
-        onOpenChange={setIsAddModalOpen}
-        size="2xl"
-        placement="center"
-        scrollBehavior="inside"
-      >
-        <ModalContent className="bg-white border border-zinc-200 text-zinc-900">
-          <ModalHeader className="text-2xl font-semibold tracking-tight text-zinc-900">
-            add a new book
-          </ModalHeader>
-          <ModalBody className="pb-6">
+          <Modal
+            isOpen={isAddModalOpen}
+            onOpenChange={setIsAddModalOpen}
+            size="2xl"
+            placement="center"
+            scrollBehavior="inside"
+          >
+            <ModalContent className="bg-white border border-zinc-200 text-zinc-900">
+              <ModalHeader className="text-2xl font-semibold tracking-tight text-zinc-900">
+                add a new book
+              </ModalHeader>
+              <ModalBody className="pb-6">
             <Tabs
               fullWidth
               aria-label="Add book type"
@@ -1151,7 +1225,34 @@ export default function Home() {
                   </Button>
                 </div>
               </Tab>
-            </Tabs>
+              </Tabs>
+            </ModalBody>
+          </ModalContent>
+        </Modal>
+      </>
+      ) : null}
+
+      <Modal
+        isOpen={isOwnerModalOpen}
+        onOpenChange={setIsOwnerModalOpen}
+        size="md"
+        placement="center"
+      >
+        <ModalContent className="bg-white border border-zinc-200 text-zinc-900">
+          <ModalHeader className="text-xl font-semibold tracking-tight text-zinc-900">
+            unlock edit mode
+          </ModalHeader>
+          <ModalBody className="pb-6">
+            <Input
+              type="password"
+              label="owner passcode"
+              value={ownerPasscode}
+              onValueChange={setOwnerPasscode}
+            />
+            {ownerError ? <p className="text-sm text-red-600">{ownerError}</p> : null}
+            <Button onPress={unlockOwnerMode} isLoading={isOwnerSubmitting}>
+              unlock
+            </Button>
           </ModalBody>
         </ModalContent>
       </Modal>
@@ -1222,8 +1323,10 @@ export default function Home() {
           ? "syncing with database..."
           : isAutoFetchingCovers
             ? "auto-fetching book covers..."
-            : isSupabaseConfigured
-              ? "auto-saves to database"
+            : isDbConfigured
+              ? isOwner
+                ? "owner mode: edits sync to database"
+                : "viewer mode: read-only"
               : "auto-saves in your browser"}
       </motion.div>
     </div>

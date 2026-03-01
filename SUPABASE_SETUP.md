@@ -16,21 +16,14 @@ on public.library_state
 for select
 using (true);
 
-create policy "public write library state"
-on public.library_state
-for insert
-with check (true);
-
-create policy "public update library state"
-on public.library_state
-for update
-using (true)
-with check (true);
+-- no public write policies (writes go through server route with service role)
 
 3) add env vars in your vercel project and local env:
 - NEXT_PUBLIC_SUPABASE_URL
 - NEXT_PUBLIC_SUPABASE_ANON_KEY
+- SUPABASE_SERVICE_ROLE_KEY
+- OWNER_PASSCODE
 
 notes:
-- this is open write access for now (no auth), so anyone with the app can edit.
-- after this works, we can lock editing to your account only.
+- viewers can read, but only owner mode can write.
+- owner mode is unlocked with OWNER_PASSCODE.
