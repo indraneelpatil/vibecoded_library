@@ -20,6 +20,7 @@ import {
 } from "@heroui/react";
 import { motion } from "framer-motion";
 import { type ReactNode, useEffect, useRef, useState } from "react";
+import { isSupabaseConfigured, supabase } from "../lib/supabaseClient";
 
 type ReadBook = {
   id: string;
@@ -63,6 +64,8 @@ type BookDetail = {
 };
 
 const STORAGE_KEY = "neels-library-v2";
+const SUPABASE_TABLE = "library_state";
+const SUPABASE_ROW_ID = "main";
 const BULK_IMPORT_KEY = "neels-library-bulk-import-v1";
 const BULK_READ_IMPORT_KEY = "neels-library-bulk-read-import-v1";
 const COVER_CACHE_KEY = "neels-library-cover-cache-v1";
@@ -198,6 +201,12 @@ function coverCacheKey(title: string, author?: string) {
   return `${title.trim().toLowerCase()}::${(author ?? "").trim().toLowerCase()}`;
 }
 
+function instantCoverFallback(title: string) {
+  const trimmed = title.trim();
+  if (!trimmed) return null;
+  return `https://covers.openlibrary.org/b/title/${encodeURIComponent(trimmed)}-L.jpg`;
+}
+
 export default function Home() {
   const [readTitle, setReadTitle] = useState("");
   const [readAuthor, setReadAuthor] = useState("");
@@ -223,8 +232,12 @@ export default function Home() {
   const [isSavingToRead, setIsSavingToRead] = useState(false);
   const [busyCoverId, setBusyCoverId] = useState<string | null>(null);
   const [isAutoFetchingCovers, setIsAutoFetchingCovers] = useState(false);
+  const [isDbSyncing, setIsDbSyncing] = useState(false);
+  const [hasDbHydrated, setHasDbHydrated] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
-  const autoFetchRan = useRef(false);
+  const autoFetchInFlight = useRef(false);
+  const attemptedCoverKeys = useRef<Set<string>>(new Set());
+  const dbWriteTimeoutRef = useRef<number | null>(null);
   const coverCacheRef = useRef<Map<string, string>>(new Map());
 
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -378,15 +391,135 @@ export default function Home() {
   }, [isLoaded, readBooks, toReadBooks]);
 
   useEffect(() => {
-    if (!isLoaded || autoFetchRan.current) return;
-    autoFetchRan.current = true;
+    if (!isLoaded) return;
+    const db = supabase;
+    if (!isSupabaseConfigured || !db) {
+      setHasDbHydrated(true);
+      return;
+    }
+
+    let cancelled = false;
+
+    const hydrateFromDb = async () => {
+      setIsDbSyncing(true);
+      const { data } = await db
+        .from(SUPABASE_TABLE)
+        .select("payload")
+        .eq("id", SUPABASE_ROW_ID)
+        .maybeSingle();
+
+      if (cancelled) return;
+
+      if (data?.payload && typeof data.payload === "object") {
+        const payload = data.payload as {
+          readBooks?: Array<Partial<ReadBook>>;
+          toReadBooks?: Array<Partial<ToReadBook>>;
+        };
+        const remoteRead = (payload.readBooks ?? []).map((book) => ({
+          id: book.id ?? crypto.randomUUID(),
+          title: (book.title ?? "untitled").trim(),
+          author: (book.author ?? "").trim(),
+          genre: (book.genre ?? "").trim(),
+          recommendedBy: (book.recommendedBy ?? "").trim(),
+          rating: safeRating(book.rating),
+          liked: (book.liked ?? "").trim(),
+          notes: (book.notes ?? "").trim(),
+          year: safeYear(book.year),
+          coverUrl:
+            book.coverUrl ??
+            coverCacheRef.current.get(coverCacheKey(book.title ?? "untitled", book.author ?? "")) ??
+            null,
+          createdAt: book.createdAt ?? new Date().toISOString(),
+        }));
+        const remoteToRead = (payload.toReadBooks ?? []).map((book) => ({
+          id: book.id ?? crypto.randomUUID(),
+          title: (book.title ?? "untitled").trim(),
+          author: (book.author ?? "").trim(),
+          genre: (book.genre ?? "").trim(),
+          recommendedBy: (book.recommendedBy ?? "").trim(),
+          reason: (book.reason ?? "").trim(),
+          coverUrl:
+            book.coverUrl ??
+            coverCacheRef.current.get(coverCacheKey(book.title ?? "untitled", book.author ?? "")) ??
+            null,
+          createdAt: book.createdAt ?? new Date().toISOString(),
+        }));
+
+        setReadBooks(remoteRead);
+        setToReadBooks(remoteToRead);
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({ readBooks: remoteRead, toReadBooks: remoteToRead }),
+        );
+      } else {
+        const fallbackRaw = localStorage.getItem(STORAGE_KEY);
+        const fallbackParsed = fallbackRaw
+          ? (JSON.parse(fallbackRaw) as LibraryData)
+          : { readBooks: [], toReadBooks: [] };
+        await db.from(SUPABASE_TABLE).upsert({
+          id: SUPABASE_ROW_ID,
+          payload: {
+            readBooks: fallbackParsed.readBooks ?? [],
+            toReadBooks: fallbackParsed.toReadBooks ?? [],
+          },
+          updated_at: new Date().toISOString(),
+        });
+      }
+
+      if (!cancelled) {
+        setHasDbHydrated(true);
+        setIsDbSyncing(false);
+      }
+    };
+
+    hydrateFromDb();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoaded]);
+
+  useEffect(() => {
+    const db = supabase;
+    if (!isLoaded || !hasDbHydrated || !isSupabaseConfigured || !db) return;
+    if (dbWriteTimeoutRef.current !== null) {
+      window.clearTimeout(dbWriteTimeoutRef.current);
+    }
+    dbWriteTimeoutRef.current = window.setTimeout(async () => {
+      await db.from(SUPABASE_TABLE).upsert({
+        id: SUPABASE_ROW_ID,
+        payload: { readBooks, toReadBooks },
+        updated_at: new Date().toISOString(),
+      });
+    }, 500);
+
+    return () => {
+      if (dbWriteTimeoutRef.current !== null) {
+        window.clearTimeout(dbWriteTimeoutRef.current);
+      }
+    };
+  }, [isLoaded, hasDbHydrated, readBooks, toReadBooks]);
+
+  useEffect(() => {
+    if (!isLoaded || autoFetchInFlight.current) return;
     let cancelled = false;
 
     const autoFetch = async () => {
-      const readMissing = readBooks.filter((book) => !book.coverUrl).slice(0, AUTO_COVER_BATCH);
-      const toReadMissing = toReadBooks.filter((book) => !book.coverUrl).slice(0, AUTO_COVER_BATCH);
+      const readMissing = readBooks
+        .filter((book) => {
+          const key = coverCacheKey(book.title, book.author);
+          return !book.coverUrl && !attemptedCoverKeys.current.has(key);
+        })
+        .slice(0, AUTO_COVER_BATCH);
+      const toReadMissing = toReadBooks
+        .filter((book) => {
+          const key = coverCacheKey(book.title, book.author);
+          return !book.coverUrl && !attemptedCoverKeys.current.has(key);
+        })
+        .slice(0, AUTO_COVER_BATCH);
       if (readMissing.length === 0 && toReadMissing.length === 0) return;
 
+      autoFetchInFlight.current = true;
       setIsAutoFetchingCovers(true);
 
       const allMissing = [
@@ -403,6 +536,9 @@ export default function Home() {
           coverUrl: await fetchCoverUrl(book.title, book.author),
         })),
       );
+      for (const item of allMissing) {
+        attemptedCoverKeys.current.add(coverCacheKey(item.title, item.author));
+      }
 
       if (!cancelled) {
         const readMap = new Map(
@@ -430,8 +566,9 @@ export default function Home() {
             prev.map((book) => (toReadMap.has(book.id) ? { ...book, coverUrl: toReadMap.get(book.id)! } : book)),
           );
         }
-        setIsAutoFetchingCovers(false);
       }
+      setIsAutoFetchingCovers(false);
+      autoFetchInFlight.current = false;
     };
 
     autoFetch();
@@ -624,6 +761,9 @@ export default function Home() {
     return <div className="space-y-2">{blocks}</div>;
   };
 
+  const getDisplayCover = (title: string, coverUrl: string | null) =>
+    coverUrl ?? instantCoverFallback(title);
+
   return (
     <div className="relative min-h-screen bg-[radial-gradient(circle_at_top,#ffffff_0%,#f5f5f7_48%,#eef0f3_100%)] font-sans text-zinc-900">
       <div className="pointer-events-none fixed inset-0 opacity-100 [background:radial-gradient(circle_at_15%_10%,rgba(255,255,255,0.9),transparent_30%),radial-gradient(circle_at_85%_0%,rgba(255,255,255,0.75),transparent_26%)]" />
@@ -729,9 +869,9 @@ export default function Home() {
                               role={isEditing ? undefined : "button"}
                               tabIndex={isEditing ? -1 : 0}
                             >
-                              {book.coverUrl ? (
+                              {getDisplayCover(book.title, book.coverUrl) ? (
                                 <Image
-                                  src={book.coverUrl}
+                                  src={getDisplayCover(book.title, book.coverUrl)!}
                                   alt={`${book.title} cover`}
                                   width={170}
                                   height={255}
@@ -879,14 +1019,14 @@ export default function Home() {
                             role="button"
                             tabIndex={0}
                           >
-                            {book.coverUrl ? (
+                            {getDisplayCover(book.title, book.coverUrl) ? (
                               <Image
-                                src={book.coverUrl}
+                                src={getDisplayCover(book.title, book.coverUrl)!}
                                 alt={`${book.title} cover`}
                                 width={170}
                                 height={255}
-                              className="h-[280px] w-full rounded-md object-cover shadow-sm sm:h-[255px] sm:w-[170px]"
-                            />
+                                className="h-[280px] w-full rounded-md object-cover shadow-sm sm:h-[255px] sm:w-[170px]"
+                              />
                           ) : (
                               <div className="h-[280px] w-full rounded-md bg-zinc-100 text-[11px] text-zinc-500 grid place-items-center px-1 text-center sm:h-[255px] sm:w-[170px]">
                               no cover
@@ -1030,9 +1170,9 @@ export default function Home() {
           {detailBook ? (
             <ModalBody className="pb-6">
               <div className="flex flex-col gap-4 sm:flex-row">
-                {detailBook.coverUrl ? (
+                {getDisplayCover(detailBook.title, detailBook.coverUrl) ? (
                   <Image
-                    src={detailBook.coverUrl}
+                    src={getDisplayCover(detailBook.title, detailBook.coverUrl)!}
                     alt={`${detailBook.title} cover`}
                     width={130}
                     height={195}
@@ -1078,7 +1218,13 @@ export default function Home() {
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.2 }}
       >
-        {isAutoFetchingCovers ? "auto-fetching book covers..." : "auto-saves in your browser"}
+        {isDbSyncing
+          ? "syncing with database..."
+          : isAutoFetchingCovers
+            ? "auto-fetching book covers..."
+            : isSupabaseConfigured
+              ? "auto-saves to database"
+              : "auto-saves in your browser"}
       </motion.div>
     </div>
   );
